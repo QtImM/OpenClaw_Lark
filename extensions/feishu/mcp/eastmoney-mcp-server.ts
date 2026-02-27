@@ -24,7 +24,7 @@ function writeResponse(res: JsonRpcResponse): void {
 }
 
 function parseConfigFromEnv(): EastMoneyOnePagerConfig {
-  const endpoint = process.env.EASTMONEY_ENDPOINT ?? "http://datacenter.eastmoney.com";
+  const endpoint = process.env.EASTMONEY_ENDPOINT ?? "https://datacenter-web.eastmoney.com";
   const timeoutMsRaw = process.env.EASTMONEY_TIMEOUT_MS;
   const timeoutMs = timeoutMsRaw ? Number(timeoutMsRaw) : 10_000;
   return {

@@ -9,7 +9,11 @@ import type { FeishuConfig } from "./types.js";
 type EastMoneyTableResponse = {
   code?: number;
   msg?: string;
-  result?: Array<Record<string, unknown>>;
+  result?:
+    | Array<Record<string, unknown>>
+    | {
+        data?: Array<Record<string, unknown>>;
+      };
   data?: {
     fields?: string[];
     items?: Array<Array<string | number | null>>;
@@ -23,6 +27,7 @@ type EastMoneyBasicsRow = {
   industry?: string;
   market?: string;
   list_date?: string;
+  business?: string;
 };
 
 type EastMoneyDetailRow = {
@@ -33,6 +38,7 @@ type EastMoneyDetailRow = {
   volume?: number;
   amount?: number;
   market_value?: number;
+  name?: string;
 };
 
 type EastMoneyFinanceRow = {
@@ -156,10 +162,20 @@ export function resolveEastMoneyOnePagerConfig(
   const fromConfig = feishuCfg.eastmoneyOnePager;
 
   const enabled = fromConfig?.enabled ?? true;
-  const endpoint = fromConfig?.endpoint ?? "http://datacenter.eastmoney.com";
+  const endpoint = fromConfig?.endpoint ?? "https://datacenter-web.eastmoney.com";
   const timeoutMs = fromConfig?.timeoutMs ?? 10_000;
 
   return { enabled, endpoint, timeoutMs };
+}
+
+function normalizeStockCode(input: string): { code: string; marketPrefix: "0" | "1" } | null {
+  const trimmed = input.trim().toLowerCase();
+  const numeric = trimmed.replace(/[^0-9]/g, "");
+  if (numeric.length !== 6) {
+    return null;
+  }
+  const marketPrefix = numeric.startsWith("6") ? "1" : "0";
+  return { code: numeric, marketPrefix };
 }
 
 /**
@@ -172,47 +188,112 @@ async function lookupEastMoneyStockCode(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
-  try {
-    // 首先尝试东方财富搜索接口
+  async function trySuggestSearch(query: string): Promise<{ code?: string; name?: string } | null> {
+    const url = `https://searchapi.eastmoney.com/api/suggest/get?input=${encodeURIComponent(
+      query,
+    )}&type=14`;
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      return null;
+    }
+    const text = await response.text();
+    const jsonText = text.trim().startsWith("{")
+      ? text
+      : text.replace(/^\w+\(/, "").replace(/\)\s*;?$/, "");
+    let payload: Record<string, unknown> | null = null;
     try {
-      const response = await fetch(
-        `${config.endpoint}/SecuritiesSearch/api/data?type=stock&query=${encodeURIComponent(companyName)}&pageIndex=0&pageSize=5`,
-        { signal: controller.signal },
+      payload = JSON.parse(jsonText) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    const table = payload?.QuotationCodeTable as { Data?: Array<Record<string, unknown>> } | null;
+    const rows = table?.Data ?? [];
+    if (rows.length === 0) {
+      return null;
+    }
+    const first = rows[0];
+    const code =
+      String(first.Code ?? first.SecurityCode ?? first.SECCODE ?? first.code ?? "").replace(
+        /[^0-9]/g,
+        "",
       );
+    const name = String(first.Name ?? first.SecurityName ?? first.SECURITY_NAME ?? "").trim();
+    if (!code) return null;
+    return { code, name: name || query };
+  }
 
-      if (response.ok) {
-        const payload = (await response.json()) as EastMoneyTableResponse;
-        if (payload.result && payload.result.length > 0) {
-          const first = payload.result[0] as Record<string, unknown>;
-          return {
-            code: String(first.code ?? ""),
-            name: String(first.name ?? ""),
-          };
-        }
-      }
-    } catch (_eastmoneyErr) {
-      // EastMoney API 失败，继续尝试网易财经
+  async function tryDataCenterSearch(
+    filter: string,
+  ): Promise<{ code?: string; name?: string } | null> {
+    const url =
+      `${config.endpoint}/api/data/v1/get?` +
+      `reportName=RPTA_WEB_STOCK_BASIC&columns=SECURITY_CODE,SECURITY_NAME_ABBR&` +
+      `filter=${encodeURIComponent(filter)}&pageNumber=1&pageSize=5&source=WEB&client=WEB`;
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as EastMoneyTableResponse;
+    const rows = Array.isArray(payload.result)
+      ? payload.result
+      : payload.result?.data ?? [];
+    if (rows.length === 0) {
+      return null;
+    }
+    const first = rows[0] as Record<string, unknown>;
+    return {
+      code: String(first.SECURITY_CODE ?? ""),
+      name: String(first.SECURITY_NAME_ABBR ?? ""),
+    };
+  }
+
+  async function tryPushSuggest(query: string): Promise<{ code?: string; name?: string } | null> {
+    const url = `https://push2.eastmoney.com/api/qt/suggest/get?input=${encodeURIComponent(
+      query,
+    )}&type=14`;
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as { data?: Array<Record<string, unknown>> };
+    const rows = payload.data ?? [];
+    if (rows.length === 0) return null;
+    const first = rows[0];
+    const code =
+      String(first.code ?? first.securityCode ?? first.SECURITY_CODE ?? "").replace(/[^0-9]/g, "");
+    const name = String(first.name ?? first.securityName ?? first.SECURITY_NAME ?? "").trim();
+    if (!code) return null;
+    return { code, name: name || query };
+  }
+
+  try {
+    // 如果输入看起来就是股票代码，直接返回
+    const normalized = normalizeStockCode(companyName);
+    if (normalized) {
+      return { code: normalized.code, name: companyName };
     }
 
-    // 备选：网易财经搜索接口
-    const neteaseUrl = `https://api.money.163.com/fundswap/do_search?input=${encodeURIComponent(companyName)}&type=stock`;
-    const neteaseRes = await fetch(neteaseUrl, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-    });
+    // 先尝试 EastMoney 搜索建议接口
+    const suggest = await trySuggestSearch(companyName);
+    if (suggest?.code) {
+      return suggest;
+    }
 
-    if (neteaseRes.ok) {
-      const neteaseData = await neteaseRes.json();
-      if (neteaseData.gp && Array.isArray(neteaseData.gp) && neteaseData.gp.length > 0) {
-        const first = neteaseData.gp[0];
-        return {
-          code: String(first.code ?? first.symbol ?? ""),
-          name: String(first.name ?? ""),
-        };
-      }
+    const pushSuggest = await tryPushSuggest(companyName);
+    if (pushSuggest?.code) {
+      return pushSuggest;
+    }
+
+    // 使用数据中心接口按简称匹配（精确）
+    const exact = await tryDataCenterSearch(`(SECURITY_NAME_ABBR="${companyName}")`);
+    if (exact?.code) {
+      return exact;
+    }
+
+    // 模糊匹配（包含）
+    const like = await tryDataCenterSearch(`(SECURITY_NAME_ABBR like "%${companyName}%")`);
+    if (like?.code) {
+      return like;
     }
 
     return null;
@@ -237,22 +318,13 @@ async function queryEastMoneyBasics(
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
   try {
-    // 标准化代码：ABC123 → sh600000 or sz000000
-    let normalizedCode = code.toUpperCase();
-    if (!normalizedCode.startsWith("sh") && !normalizedCode.startsWith("sz")) {
-      // 假设 6 开头是沪市，0/3 开头是深市
-      const numPart = normalizedCode.replace(/[A-Z]/g, "");
-      if (numPart.startsWith("6")) {
-        normalizedCode = `sh${numPart}`;
-      } else if (numPart.startsWith("0") || numPart.startsWith("3")) {
-        normalizedCode = `sz${numPart}`;
-      }
-    }
-
+    const normalized = normalizeStockCode(code) ?? normalizeStockCode(code.replace(/^sh|^sz/i, ""));
+    const numericCode = normalized?.code ?? code.replace(/[^0-9]/g, "");
+    const filter = `(SECURITY_CODE="${numericCode}")`;
     const response = await fetch(
-      `${config.endpoint}/Securities/api/data?` +
-        `namespace=Ths_BasicData&pageIndex=0&pageSize=100&` +
-        `sortTypes=1&sortFields=code&code=${normalizedCode}`,
+      `${config.endpoint}/api/data/v1/get?` +
+        `reportName=RPTA_WEB_STOCK_BASIC&columns=ALL&` +
+        `filter=${encodeURIComponent(filter)}&pageNumber=1&pageSize=1&source=WEB&client=WEB`,
       { signal: controller.signal },
     );
 
@@ -261,8 +333,20 @@ async function queryEastMoneyBasics(
     }
 
     const payload = (await response.json()) as EastMoneyTableResponse;
-    if (payload.result && payload.result.length > 0) {
-      return payload.result[0] as EastMoneyBasicsRow;
+    const rows = Array.isArray(payload.result)
+      ? payload.result
+      : payload.result?.data ?? [];
+    if (rows.length > 0) {
+      const row = rows[0] as Record<string, unknown>;
+      return {
+        code: String(row.SECURITY_CODE ?? ""),
+        name: String(row.SECURITY_NAME_ABBR ?? row.SECURITY_NAME ?? ""),
+        area: String(row.AREA ?? row.PROVINCE ?? ""),
+        industry: String(row.INDUSTRY ?? row.INDUSTRY_NAME ?? ""),
+        market: String(row.MARKET ?? ""),
+        list_date: String(row.LISTING_DATE ?? row.LIST_DATE ?? ""),
+        business: String(row.MAIN_BUSINESS ?? row.BUSINESS_SCOPE ?? row.BUSINESS ?? ""),
+      };
     }
 
     return null;
@@ -287,10 +371,12 @@ async function queryEastMoneyDetail(
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
   try {
+    const normalized = normalizeStockCode(code) ?? normalizeStockCode(code.replace(/^sh|^sz/i, ""));
+    if (!normalized) return null;
+    const secid = `${normalized.marketPrefix}.${normalized.code}`;
     const response = await fetch(
-      `${config.endpoint}/Securities/api/data?` +
-        `namespace=Ths_StockDetail&pageIndex=0&pageSize=100&` +
-        `sortTypes=1&sortFields=code&code=${code}`,
+      `https://push2.eastmoney.com/api/qt/stock/get?` +
+        `fields=f43,f44,f45,f46,f47,f48,f57,f58,f116,f117,f9,f10,f169,f170&secid=${secid}`,
       { signal: controller.signal },
     );
 
@@ -298,12 +384,23 @@ async function queryEastMoneyDetail(
       throw new Error(`HTTP ${response.status}`);
     }
 
-    const payload = (await response.json()) as EastMoneyTableResponse;
-    if (payload.result && payload.result.length > 0) {
-      return payload.result[0] as EastMoneyDetailRow;
-    }
+    const payload = (await response.json()) as { data?: Record<string, unknown> };
+    const data = payload.data ?? {};
+    const rawPrice = Number(data.f43 ?? NaN);
+    const price =
+      Number.isFinite(rawPrice) && rawPrice > 10000 ? rawPrice / 100 : rawPrice;
+    const marketValue = Number(data.f116 ?? NaN);
+    const name = typeof data.f58 === "string" ? data.f58 : undefined;
+    const pe = Number(data.f9 ?? NaN);
+    const pb = Number(data.f10 ?? NaN);
 
-    return null;
+    return {
+      price: Number.isFinite(price) ? price : undefined,
+      market_value: Number.isFinite(marketValue) ? marketValue : undefined,
+      name,
+      pe: Number.isFinite(pe) ? pe : undefined,
+      pb: Number.isFinite(pb) ? pb : undefined,
+    };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error("EastMoney detail query timeout");
@@ -322,96 +419,6 @@ async function queryEastMoneyFinance(
   _config: EastMoneyOnePagerConfig,
 ): Promise<EastMoneyFinanceRow | null> {
   return null;
-}
-
-/**
- * 从 Tushare 查询财务数据（如果有 token）
- */
-async function queryTushareFinance(
-  code: string,
-  companyName: string,
-  timeoutMs: number,
-): Promise<EastMoneyFinanceRow | null> {
-  const token = process.env.TUSHARE_TOKEN;
-  if (!token) {
-    return null;
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    // 第一次：获取 TS 代码
-    const basicRes = await fetch("https://api.tushare.pro", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        api_name: "stock_basic",
-        token: token,
-        params: { name: companyName },
-        fields: "ts_code,symbol,name",
-      }),
-    });
-
-    if (!basicRes.ok) {
-      return null;
-    }
-
-    const basicData = await basicRes.json();
-    if (basicData.code !== 0 || !basicData.data || basicData.data.length === 0) {
-      return null;
-    }
-
-    const tsCode = basicData.data[0].ts_code;
-    if (!tsCode) {
-      return null;
-    }
-
-    // 第二次：获取财务数据
-    const finRes = await fetch("https://api.tushare.pro", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        api_name: "fina_mainbz",
-        token: token,
-        params: { ts_code: tsCode, period: "20251231" },
-        fields:
-          "ts_code,end_date,revenue,profit,assets,liab,debt_to_assets,current_ratio,quick_ratio,roe",
-      }),
-    });
-
-    if (!finRes.ok) {
-      return null;
-    }
-
-    const finData = await finRes.json();
-    if (finData.code !== 0 || !finData.data || finData.data.length === 0) {
-      return null;
-    }
-
-    const record = finData.data[0];
-    return {
-      revenue: record.revenue ? Number(record.revenue) : undefined,
-      profit: record.profit ? Number(record.profit) : undefined,
-      roe: record.roe ? Number(record.roe) : undefined,
-      asset_debt_ratio: record.debt_to_assets ? Number(record.debt_to_assets) : undefined,
-      current_ratio: record.current_ratio ? Number(record.current_ratio) : undefined,
-      quick_ratio: record.quick_ratio ? Number(record.quick_ratio) : undefined,
-    };
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error("Tushare query timeout");
-    }
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -581,7 +588,7 @@ export async function generateEastMoneyOnePagerStructured(params: {
     }
 
     const code = lookupResult.code as string;
-    const displayName = lookupResult.name as string;
+    let displayName = lookupResult.name as string;
 
     if (!code) {
       return {
@@ -590,17 +597,19 @@ export async function generateEastMoneyOnePagerStructured(params: {
       };
     }
 
-    // 第 2 步：并行查询基本信息、详情、财务数据
-    // 财务数据优先尝试 Tushare，然后回退到 EastMoney
-    const [basics, detail, financeFromTushare, financeFromEastMoney] = await Promise.all([
+    // 第 2 步：并行查询基本信息、详情、财务数据（仅 EastMoney）
+    const [basics, detail, financeFromEastMoney] = await Promise.all([
       queryEastMoneyBasics(code, config).catch(() => null),
       queryEastMoneyDetail(code, config).catch(() => null),
-      queryTushareFinance(code, displayName, config.timeoutMs).catch(() => null),
       queryEastMoneyFinance(code, config).catch(() => null),
     ]);
 
-    // 选择财务数据来源（优先 Tushare）
-    const finance = financeFromTushare || financeFromEastMoney;
+    // 选择财务数据来源（仅 EastMoney）
+    const finance = financeFromEastMoney;
+
+    if ((!displayName || displayName === code) && detail?.name) {
+      displayName = detail.name;
+    }
 
     const basicsLines: string[] = [];
     basicsLines.push(`公司名称：${displayName}`);
@@ -619,8 +628,11 @@ export async function generateEastMoneyOnePagerStructured(params: {
     }
 
     const businessLines: string[] = [];
+    if (basics?.business) {
+      businessLines.push(basics.business);
+    }
     if (basics?.industry) {
-      businessLines.push(`主营方向：${basics.industry}`);
+      businessLines.push(`所属行业：${basics.industry}`);
     }
     if (basics?.area) {
       businessLines.push(`主要经营地区：${basics.area}`);
@@ -631,7 +643,7 @@ export async function generateEastMoneyOnePagerStructured(params: {
       financialLines.push(`最新价格：${formatNumber(Number(detail.price), 2)} 元`);
     }
     if (detail?.pe !== undefined) {
-      financialLines.push(`PE 倍数：${formatPercent(Number(detail.pe))}`);
+      financialLines.push(`PE 倍数：${formatNumber(Number(detail.pe), 2)}`);
     }
     if (detail?.pb !== undefined) {
       financialLines.push(`PB 倍数：${formatNumber(Number(detail.pb), 2)}`);
@@ -656,6 +668,15 @@ export async function generateEastMoneyOnePagerStructured(params: {
       list_date: basics?.list_date ? String(basics.list_date) : undefined,
     });
 
+    if (highlights.length === 0) {
+      if (detail?.market_value) {
+        highlights.push(`市值约 ${formatNumber(Number(detail.market_value), 0)}，具备规模优势`);
+      }
+      if (detail?.price) {
+        highlights.push(`最新价格 ${formatNumber(Number(detail.price), 2)} 元，市场关注度高`);
+      }
+    }
+
     // 风险提示
     const risks = generateRisks({
       pe: detail?.pe ? Number(detail.pe) : undefined,
@@ -665,11 +686,7 @@ export async function generateEastMoneyOnePagerStructured(params: {
     });
 
     // 数据来源说明
-    const dataSource = financeFromTushare
-      ? "Tushare"
-      : financeFromEastMoney
-        ? "EastMoney"
-        : "混合数据源";
+    const dataSource = financeFromEastMoney ? "EastMoney" : "混合数据源";
     const updatedAt = new Date().toLocaleDateString("zh-CN");
 
     const structured: EastMoneyOnePagerStructured = {

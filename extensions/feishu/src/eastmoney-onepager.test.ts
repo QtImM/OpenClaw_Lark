@@ -187,7 +187,7 @@ describe("resolveEastMoneyOnePagerConfig", () => {
     const resolved = resolveEastMoneyOnePagerConfig(config, {});
 
     expect(resolved.enabled).toBe(true);
-    expect(resolved.endpoint).toBe("http://datacenter.eastmoney.com");
+    expect(resolved.endpoint).toBe("https://datacenter-web.eastmoney.com");
     expect(resolved.timeoutMs).toBe(10000);
   });
 
