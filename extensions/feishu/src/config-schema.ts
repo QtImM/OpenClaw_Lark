@@ -71,6 +71,44 @@ const DynamicAgentCreationSchema = z
   .strict()
   .optional();
 
+const TushareOnePagerSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    token: z.string().optional(),
+    endpoint: z.string().url().optional(),
+    timeoutMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+const LlmOnePagerSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    systemPrompt: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
+const EastMoneyOnePagerSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    endpoint: z.string().url().optional(),
+    timeoutMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+const EastMoneyMcpSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    command: z.string().optional(),
+    args: z.array(z.string()).optional(),
+    timeoutMs: z.number().int().positive().optional(),
+    fallbackToDirect: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
 /**
  * Feishu tools configuration.
  * Controls which tool categories are enabled.
@@ -135,6 +173,10 @@ const FeishuSharedConfigShape = {
   renderMode: RenderModeSchema,
   streaming: StreamingModeSchema,
   tools: FeishuToolsConfigSchema,
+  tushareOnePager: TushareOnePagerSchema,
+  llmOnePager: LlmOnePagerSchema,
+  eastmoneyOnePager: EastMoneyOnePagerSchema,
+  eastmoneyMcp: EastMoneyMcpSchema,
 };
 
 /**

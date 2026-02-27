@@ -254,7 +254,7 @@ async function monitorWebhook({
   log(`feishu[${accountId}]: starting Webhook server on ${host}:${port}, path ${path}...`);
 
   const server = http.createServer();
-  const webhookHandler = Lark.adaptDefault(path, eventDispatcher, { autoChallenge: true });
+    const webhookHandler = Lark.adaptDefault(path, eventDispatcher, { autoChallenge: true });
   server.on("request", (req, res) => {
     res.on("finish", () => {
       recordWebhookStatus(runtime, accountId, path, res.statusCode);

@@ -14,6 +14,12 @@ import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { tryRecordMessagePersistent } from "./dedup.js";
 import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
+import {
+  detectEastMoneyOnePagerCompanyQuery,
+  resolveEastMoneyOnePagerConfig,
+  generateEastMoneyOnePagerMarkdown,
+} from "./eastmoney-onepager.js";
+import { callEastMoneyMcpOnePager, resolveEastMoneyMcpConfig } from "./eastmoney-mcp.js";
 import { normalizeFeishuExternalKey } from "./external-keys.js";
 import { downloadMessageResourceFeishu } from "./media.js";
 import {
@@ -31,6 +37,11 @@ import {
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { getMessageFeishu, sendMessageFeishu } from "./send.js";
+import {
+  detectTushareOnePagerCompanyQuery,
+  resolveTushareOnePagerConfig,
+  generateTushareOnePagerMarkdown,
+} from "./tushare-onepager.js";
 import type { FeishuMessageContext, FeishuMediaInfo, ResolvedFeishuAccount } from "./types.js";
 import type { DynamicAgentCreationConfig } from "./types.js";
 
@@ -745,6 +756,98 @@ export async function handleFeishuMessage(params: {
         })
       : undefined;
 
+    // Try EastMoney One Pager if enabled
+    const eastmoneyConfig = resolveEastMoneyOnePagerConfig(feishuCfg, process.env);
+    const eastmoneyMcpConfig = resolveEastMoneyMcpConfig(feishuCfg, process.env);
+    if (eastmoneyConfig.enabled || eastmoneyMcpConfig.enabled) {
+      // Detect company query using EastMoney detection
+      const companyQuery = detectEastMoneyOnePagerCompanyQuery({
+        content: ctx.content,
+        mentionedBot: ctx.mentionedBot,
+        chatType: ctx.chatType,
+        messageType: ctx.contentType,
+      });
+
+      if (companyQuery) {
+        log(
+          `feishu[${account.accountId}]: trying EastMoney One Pager for company "${companyQuery}"`,
+        );
+        try {
+          if (eastmoneyMcpConfig.enabled) {
+            const mcpResult = await callEastMoneyMcpOnePager({
+              companyName: companyQuery,
+              config: eastmoneyMcpConfig,
+              log,
+            });
+            if (mcpResult.ok) {
+              log(
+                `feishu[${account.accountId}]: EastMoney MCP One Pager generated successfully for "${companyQuery}"`,
+              );
+              await sendMessageFeishu({
+                cfg,
+                to: `chat:${ctx.chatId}`,
+                text: mcpResult.markdown,
+                accountId: account.accountId,
+              });
+              return;
+            }
+
+            log(
+              `feishu[${account.accountId}]: EastMoney MCP One Pager failed: ${mcpResult.error}`,
+            );
+            if (!eastmoneyMcpConfig.fallbackToDirect) {
+              await sendMessageFeishu({
+                cfg,
+                to: `chat:${ctx.chatId}`,
+                text: `抱歉，MCP 查询失败：\n${mcpResult.error}`,
+                accountId: account.accountId,
+              });
+              return;
+            }
+          }
+
+          const eastmoneyResult = await generateEastMoneyOnePagerMarkdown({
+            companyName: companyQuery,
+            config: eastmoneyConfig,
+          });
+          if (eastmoneyResult.ok) {
+            log(
+              `feishu[${account.accountId}]: EastMoney One Pager generated successfully for "${companyQuery}"`,
+            );
+            // Send the EastMoney One Pager directly and return early
+            await sendMessageFeishu({
+              cfg,
+              to: `chat:${ctx.chatId}`,
+              text: eastmoneyResult.markdown,
+              accountId: account.accountId,
+            });
+            return; // Early return - don't process as normal message
+          }
+          log(
+            `feishu[${account.accountId}]: EastMoney One Pager failed: ${eastmoneyResult.error}`,
+          );
+          // Send error message
+          await sendMessageFeishu({
+            cfg,
+            to: `chat:${ctx.chatId}`,
+            text: `抱歉，无法生成 One Pager：\n${eastmoneyResult.error}`,
+            accountId: account.accountId,
+          });
+          return; // Early return - don't process as normal message
+        } catch (err) {
+          log(`feishu[${account.accountId}]: EastMoney One Pager exception: ${String(err)}`);
+          // Send error message
+          await sendMessageFeishu({
+            cfg,
+            to: `chat:${ctx.chatId}`,
+            text: `抱歉，查询出错：${String(err)}`,
+            accountId: account.accountId,
+          });
+          return; // Early return - don't process as normal message
+        }
+      }
+    }
+
     // In group chats, the session is scoped to the group, but the *speaker* is the sender.
     // Using a group-scoped From causes the agent to treat different users as the same person.
     const feishuFrom = `feishu:${ctx.senderOpenId}`;
@@ -857,11 +960,14 @@ export async function handleFeishuMessage(params: {
     }
 
     const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(cfg);
-    const messageBody = buildFeishuAgentBody({
+
+    // Build message body
+    let messageBody = buildFeishuAgentBody({
       ctx,
       quotedContent,
       permissionErrorForAgent,
     });
+
     const envelopeFrom = isGroup ? `${ctx.chatId}:${ctx.senderOpenId}` : ctx.senderOpenId;
     if (permissionErrorForAgent) {
       // Keep the notice in a single dispatch to avoid duplicate replies (#27372).
